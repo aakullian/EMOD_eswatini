@@ -289,7 +289,7 @@ sankeyNetwork(Links = plot.data.f, Nodes = nodes,
 
 ## Number of transmissions per infected per year
 
-```{r, fig.width=8, fig.height=8}
+```{r, fig.width=12, fig.height=8}
 #All ages
 t1 <- network.data.m  %>%
   group_by(scenario, sim.id, SRC_GENDER, Year) %>%
@@ -364,15 +364,16 @@ hist(network.data.m$TimeToTransmission[network.data.m$SRC_GENDER==0])
 hist(network.data.m$TimeToTransmission[network.data.m$SRC_GENDER==1])
 
 #Time to transmission density (among all transmission)
-d2 <- subset(network.data.m,acq.age>14) %>%
-  group_by(scenario, era, SRC_GENDER) %>%
+class(network.data.m$TimeToTransmission)
+d2 <- subset(network.data.m, is.na(TimeToTransmission)==F) %>%
+  group_by(scenario, era, SRC_GENDER, TimeToTransmission) %>%
   summarize(median = quantile(TimeToTransmission, probs = 0.5))
 
 labs <- c("1" = "Women", "0" = "Men")
 ggplot(subset(network.data.m, scenario=="baseline"), aes(x=TimeToTransmission, fill=factor(SRC_GENDER), color=factor(SRC_GENDER))) +
   geom_density(alpha=0.3, adjust=3) +
   facet_grid(era~SRC_GENDER, labeller=labeller(SRC_GENDER = labs)) +
-  scale_color_manual(values = c("blue3","red2"), labels=c("Men","Women")) +
+  #scale_color_manual(values = c("blue3","red2"), labels=c("Men","Women")) +
   scale_fill_manual(values = c("blue3","red2"), labels=c("Men","Women")) +
   ggtitle("Distribution of time to transmission") +
   theme_bw(base_size=24) +  xlab("Years")+ 
@@ -459,7 +460,7 @@ ggplot(subset(TimeToTransmissionProportions, TimeToTransmissionCat=="[0,1)" & sc
 
 ## Estimate Reff within the first year of acquisition (How many secondary transmissions occur among those infected for < 1 year?)
 
-```{r, fig.width=12, fig.height=12}
+```{r, fig.width=18, fig.height=12}
 
 t1 <- network.data.m %>% 
   filter(!is.na(acq.year)) %>% mutate(acq.year = floor(acq.year)) %>%
@@ -594,39 +595,50 @@ ttable.merge <- rbind(ttable,ttable.all)
 
 timeframe = 30 #time horizon in years to calculate Reff
 ttable.years.selection <- complete(subset(ttable.merge, YearsToTransmission<timeframe+1 & acq.year%in%seq(1980,2020,5)), YearsToTransmission = 1:timeframe, fill = list(transperperson = 0)) #fill in missing month and add zeros if there were not transmission events during that month
-ttable.yearscumsum <- 
+ttable.yearscumsum.cont <- 
   ttable.years.selection %>% 
   group_by(scenario, sim.id, SRC_GENDER, acq.year) %>% #get cumulative sum
   mutate(reff = cumsum(transperperson), scenario_f = factor(scenario, levels=c('baseline',"ART100pct"))) %>%
   group_by(scenario_f, SRC_GENDER, acq.year, YearsToTransmission) %>%    
   summarize(med.transperperson=mean(transperperson), med.reff=mean(reff))  #get mean across 250 simulations 
+#categorize continuous yeartstotransmission into fewer categories for better plotting
+ttable.yearscumsum.cont$med.transperperson.cat <- cut(ttable.yearscumsum.cont$YearsToTransmission, c(0,1,2,3,4,5,10,15,20,25,30), right=T)
+ttable.yearscumsum <-  ttable.yearscumsum.cont %>% 
+  group_by(scenario_f, SRC_GENDER, acq.year, med.transperperson.cat) %>% 
+  summarise(med.transperperson =sum(med.transperperson), med.reff = max(med.reff), YearsToTransmission=max(YearsToTransmission))
+ttable.yearscumsum$TransmissionYear <- ttable.yearscumsum$YearsToTransmission + ttable.yearscumsum$acq.year
 
-ggplot(subset(ttable.yearscumsum, YearsToTransmission%in%seq(1,30,1))) + 
+#Reff by year from acquisition and acquisition year
+labs <- c("2"="All", "1" = "Women", "0" = "Men")
+ggplot(subset(ttable.yearscumsum)) + 
   geom_area(aes(y=med.transperperson, x=acq.year, fill=factor(YearsToTransmission)), size=1, position="stack") +
+  #geom_line(aes(y=med.reff, x=acq.year, color=factor(YearsToTransmission)), size=1) +
   facet_grid(scenario_f~SRC_GENDER, labeller=labeller(SRC_GENDER=labs, scenario_f=labs.scenario))+
   #scale_x_continuous(breaks=seq(0,timeframe,1)) + scale_y_continuous(expand = c(0,0), breaks=seq(0,0.30,0.05)) + 
   #coord_cartesian(ylim=c(0, 0.29)) +
-  xlab("Years since HIV acquisition")+ ylab("Reff") +
-  geom_hline(yintercept=1, linetype=2) +
+  xlab("Year of HIV acquisition")+ ylab("transmissions per infected") +
+  geom_hline(yintercept=1, linetype=2) +   theme(text=element_text(size=24))+
   #scale_color_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
   #scale_fill_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
-  ggtitle("Number of transmissions per infected individual by year from HIV acquisition") +
+  ggtitle("Number of transmissions per infected individual by year of HIV acquisition and time from acquisition") +
   theme(strip.background = element_rect(colour="black", fill="white")) +
+  guides(fill = guide_legend(reverse=TRUE, nrow=1)) + labs(fill = "Years from HIV acquisition") +
   theme(panel.border = element_blank(), panel.grid.major = element_blank(),
-        legend.title=element_blank(),
-        panel.grid.minor = element_blank(),
-        axis.line = element_line(colour = "black"),
-        panel.background = element_blank(),
-        legend.position = "bottom") +  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+
+        panel.grid.minor = element_blank(),axis.line = element_line(colour = "black"),
+        panel.background = element_blank(), legend.position = "bottom") +  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+
   annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
 
-ggplot(ttable.yearscumsum) + 
+brks=c(0.5,1,1.5,2)
+library(metR)
+ggplot(ttable.yearscumsum.cont) + 
   geom_raster(aes(y=YearsToTransmission, x=acq.year, fill=med.reff))+ 
   scale_fill_gradientn(name="Reff",
                        colours = terrain.colors(20)) +
   facet_grid(SRC_GENDER~scenario_f, labeller=labeller(SRC_GENDER=labs, scenario_f=labs.scenario))+
-  stat_contour(aes(y=YearsToTransmission, x=acq.year, z=med.reff), color="black", size=1, linetype=1, binwidth=1) +
+  stat_contour(aes(y=YearsToTransmission, x=acq.year, z=med.reff), color="black", size=1, linetype=1, breaks=brks) +
+  geom_text_contour(aes(y=YearsToTransmission, x=acq.year, z=med.reff), size=7, rotate=F, breaks=brks) +
   theme(legend.key.height = unit(2, "cm")) +
+  labs(fill = "Reff") +
   scale_x_continuous(expand = c(0,0), breaks=seq(1985,2020,5),"HIV infected cohort") +
   scale_y_continuous(breaks=seq(0,30,5),expand = c(0,0),"Years to transmissions") +
   coord_cartesian(ylim=c(0, 30)) +
@@ -635,7 +647,7 @@ ggplot(ttable.yearscumsum) +
   theme(axis.text.x = element_text(angle = 90)) +
   annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+
   annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)+
-  theme(legend.title=element_blank(),axis.line = element_line(colour = "black"),panel.background = element_blank())
+  theme(axis.line = element_line(colour = "black"),panel.background = element_blank())
 
 ```
 
