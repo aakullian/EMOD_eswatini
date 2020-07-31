@@ -1,0 +1,683 @@
+---
+title: "Transmission dynamics in the era of test and treat" 
+author: "Adam Akullian and Josh Herbeck"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    df_print: paged
+    highlight: tango
+    toc: true
+    toc_float: true
+    theme: united
+    fig_width: 7
+    fig_height: 4
+    fig_caption: true
+    code_folding: hide
+---
+## Project description
+We used output from a stochastic agent-based epidemic model calibrated to the HIV epidemic in the Kingdom of Eswatini (formerly Swaziland) to estimate the number and relative frequency of secondary infections caused by HIV infected individuals according to age group, sex, stage of infection (acute, early, latent, AIDS), and ART status. We estimated changes in the contribution of these sources to the epidemic over the previous and next thirty years, under multiple ART-defined scenarios (e.g. pre-ART, ART, ART scale up, status-quo ART coverage (current 90-90-90 targets), and increasing levels of UTT near-perfect ART initiation
+Documentation on all model parameters: https://idmod.org/docs/hiv/software-report-transmission.html?searchText=TransmissionReport
+
+# Setup
+```{r setup, message = FALSE}
+require("knitr")
+knitr::opts_chunk$set(echo = TRUE, fig.align='center')
+opts_knit$set(root.dir = "C:\\Users\\aakullian\\Dropbox (IDM)\\GitHub\\EMOD_eswatini\\Output\\")
+
+library(kableExtra)
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(MASS)
+library(glmnet)
+library(parallel)
+library(data.table)
+library(networkD3)
+library(RColorBrewer)
+library(MESS)
+numCores <- detectCores()
+
+## Load helper functions
+#source("../Scripts/model_helper_functions.R")
+
+## Load output from EMOD
+setwd("C:\\Users\\aakullian\\Dropbox (IDM)\\GitHub\\EMOD_eswatini\\Output")
+load(file = "inputfiles2.rda") #brings in transmissionreport.csv and reporthivbyageandgender.csv
+
+#create "date of acquisition" variable as date when the dest_ID acquired HIV (whether or not there was a subsequent transmission)
+date.of.acquisition <- data.frame("SRC_ID"=transmissionreport$DEST_ID, "acq.year"=transmissionreport$YEAR, "sim.id"=transmissionreport$sim.id, "scenario"=transmissionreport$scenario) #source id used to merge in with source of transmitters
+network.data <- left_join(transmissionreport, date.of.acquisition, by=c("SRC_ID","sim.id","scenario")) #join to include date of acquisition
+
+network.data.m <- network.data %>%    
+  mutate(src.age.cat = cut(src_age_int, c(15,20,25,30,35,40,45,50,55,60,200), right=F)) %>%
+  mutate(dest.age.cat = cut(dest_age_int, c(15,20,25,30,35,40,45,50,55,60,200), right=F)) %>%
+  mutate(src.age.cat3 = cut(src_age_int, c(15,25,35,200), right=F)) %>%
+  mutate(dest.age.cat3 = cut(dest_age_int, c(15,25,35,200), right=F)) %>%
+  mutate(acq.age=src_age_int-(YEAR-acq.year)) %>% #age of source when they acquired HIV
+  mutate(TimeToTransmission = YEAR - acq.year) %>%
+  mutate(MonthsToTransmission = ceiling((YEAR - acq.year)*12)) %>% #month within which transmission occurred (e.g., 1 = transmission ocrurred within < 1 month of acq)
+  mutate(YearsToTransmission = ceiling((YEAR - acq.year))) %>% #year within which transmission occurred (e.g., 1 = transmission occurred within < 1 year of acq)
+  mutate(era = case_when(Year2 < 2016 ~ "Pre-UTT", TRUE ~ "UTT era")) %>% mutate(Year= Year2) %>%
+  mutate(src.stage.f = factor(SRC_STAGE, levels = c(1,2,3,4), labels = c("Acute","Latent","AIDS","on ART"))) %>%
+  dplyr::select(-c(SRC_STAGE, Year2)) 
+network.data.m$scenario = factor(network.data.m$scenario, levels=c('baseline','ART100pct'))
+table(network.data.m$scenario)
+
+labs <- c("1" = "Women", "0" = "Men")
+labs.age3 <- c("[15,25)"="15-24","[25,35)"="25-34","[35,200)"="35+")
+```
+## Model variables
+
+#Transmission variables
+```{r, echo = FALSE}
+var_guide_baseline <- data.frame(
+  var_name = c(names(network.data.m)),
+  descr = c(
+    "Source transmission ID",
+    "Source sex (0 = Male, 1 = Female)",
+    "Destination transmission ID",
+    "Destiation sex (0 = Male, 1 = Female)",
+    "Age of source (years)",
+    "Age of destination (years)",
+    "Year in sim time-steps",
+    "Simulation ID (N=250)",
+    "Model scenario (baseline=status quo ART, ART100pct=All HIV+ initiate ART within ~ 6 mo, viral load suppression within 1 year of acquisition",
+    "Year transmitter (dest) acquired HIV (NA if seeded in)",
+    "5-yr age category of source",
+    "5-yr age category of destination",
+    "10-yr age category of source",
+    "10-yr age category of destination",
+    "Age when transmitter acquired HIV (NA if seeded in)",
+    "Time (years with decimal) from HIV acquisition to transmission (from source persepctive)",
+    "Time (months) from HIV acquisition to transmission (from source persepctive)",
+    "Time (years) within which HIV acquisition to transmission occured (from source persepctive)",
+    "era (pre/post UTT)",
+    "Year transmission occured",
+    "Source HIV stage (Acute = untreated acute stage (2.9 months), Latent=untreated latent HIV (>3 months), AIDS=untreated AIDS, on ART=On ART"
+    )
+  )
+
+network.vars <-kable(
+  var_guide_baseline,
+  col.names = c("Variable name",
+    "Description")
+) %>% 
+  kable_styling()
+network.vars
+```
+
+#ReportHIVbyageandgender
+#Brings in reporthivbyageandgender.csv. This file defines the population at risk, new infections, and prevalent infections at each time step by strata.
+
+```{r, echo = FALSE}
+reporthivbyageandgender <- reporthivbyageandgender %>% 
+  mutate(SRC_GENDER = Gender) %>%
+  mutate(Year = Year2) %>%
+  mutate(NeverOnART = case_when(IP_Key.ARTstate == "NeverOnART" ~ 1, TRUE ~ 0)) %>%
+  mutate(src.age.cat3 = cut(Age, c(15,25,35,200), right=F)) %>%
+  mutate(src.age.cat = cut(Age, c(15,20,25,30,35,40,45,50,55,60,200), right=F)) %>%
+  dplyr::select(-c(Year2, Gender, Age)) 
+
+var_guide_reporthiv <- data.frame(
+  var_name = c(names(reporthivbyageandgender)),
+  descr = c(
+    "Is Circumcised (1=Yes, 0 =No)",
+    "ART status among HIV+ (NeverOnART=Never initiated ART, OffART=Initiated but currently off, OnART=On ART)",
+    "Newly infected with HIV (n)",
+    "Transmitters (n)",
+    "Uninfected (n)",
+    "Currently infected with HIV (n)",
+    "Total population (N)",
+    "Simulation ID (N=250)",
+    "Model scenario (baseline=status quo ART, ART100pct=All HIV+ initiate ART within ~ 6 mo, viral load suppression within 1 year of acquisition",
+    "Sex (0 = Male, 1 = Female)",
+    "Calendar year",
+    "Never initiated ART (HIV+)",
+    "Age category (5-year bins)",
+    "Age category (10-year bins)"
+  )
+)
+
+reportHIV.vars <- kable(
+  var_guide_reporthiv,
+  col.names = c("Variable name",
+    "Description")
+) %>% 
+  kable_styling()
+```
+
+## Contribution to incidence over time by stage 
+## of infection and age at transmission
+The composition of prevalent HIV infections (stage of infection) changes over time as the epidemic matures and interventions scale. Initially, most infections were caused by acutely infected individuals and infections from high-risk groups.  Over time, infections accumulated in the latent stages and shifted to lower-risk, community-level transmission.  ART scale-up directly reduced the contribution to incidence from those with untreated latent stage infection and untreated AIDS. Incidence attributed to transmission from acutely infected PLHIV also declined in the ART era primarily from the indirect effects of fewer new infections (and thus a lower prevalence of acutely infected individuals) – not from directly suppressing individuals in the acute stage.  Transmissions from PLHIV in the acute stage accounted for 10% of total incidence (<0.5 infections per 100 py) prior to ART scale-up.  After UTT, incidence attributed to PLHIV in the acute stage declined to 0.25 per 100 py, though made up a larger overall proportion of the total incidence (15%).  
+
+```{r, echo = FALSE, fig.width=10, fig.height=7}
+
+#stage
+t1 <- network.data.m  %>%
+  group_by(scenario, sim.id, Year, src.stage.f) %>%
+  summarize(transmissions=n()) 
+r1 <- subset(reporthivbyageandgender)  %>%
+  group_by(scenario, sim.id, Year) %>%
+  summarize(Uninfected.Population=sum(Uninfected.Population)) 
+ttable <- merge(t1, r1, by=c("scenario","Year","sim.id"), all.x=T) %>%
+  mutate(inc = transmissions/Uninfected.Population) %>%
+  group_by(scenario, Year, sim.id) %>%
+  mutate(freq = transmissions / sum(transmissions)) %>%
+  group_by(scenario, Year, src.stage.f) %>%
+  summarize(prop.med=median(freq), prop.lb = quantile(freq, probs = 0.025), prop.ub = quantile(freq, probs = 0.975), inc.med=median(inc), inc.lb = quantile(inc, probs = 0.025), inc.ub = quantile(inc, probs = 0.975)) 
+
+#age
+t1 <- network.data.m  %>%
+  group_by(scenario, sim.id, Year,SRC_GENDER, src.age.cat3) %>%
+  summarize(transmissions=n()) 
+r1 <- subset(reporthivbyageandgender)  %>%
+  group_by(scenario, sim.id, Year) %>%
+  summarize(Uninfected.Population=sum(Uninfected.Population)) 
+ttable.age <- merge(t1, r1, by=c("scenario","Year","sim.id"), all.x=T) %>%
+  mutate(inc = transmissions/Uninfected.Population) %>%
+  group_by(scenario, Year, sim.id) %>%
+  mutate(freq = transmissions / sum(transmissions)) %>%
+  group_by(scenario, Year,SRC_GENDER, src.age.cat3) %>%
+  summarize(prop.med=median(freq), prop.lb = quantile(freq, probs = 0.025), prop.ub = quantile(freq, probs = 0.975), inc.med=median(inc), inc.lb = quantile(inc, probs = 0.025), inc.ub = quantile(inc, probs = 0.975)) 
+
+#Incidence contribution (absolute) by HIV stage
+
+#Stacked bar plot
+ggplot(subset(ttable), aes(fill=src.stage.f, y=inc.med*100, x=Year)) + 
+  geom_bar(position="stack", stat="identity") +
+  scale_x_continuous(expand = c(0,0), breaks=seq(1980,2045,5)) +
+  scale_y_continuous(breaks=seq(0,0.035,0.005)*100,expand = c(0,0),"new infections / 100 py") +
+  facet_grid(~scenario) +
+  coord_cartesian(xlim=c(1980, 2050)) + ggtitle("HIV incidence contribution by source stage of infection") +
+  theme(strip.background = element_rect(colour="white", fill="white"), axis.text.x = element_text(angle = 90),legend.title=element_blank(),axis.line = element_line(colour = "black"),panel.background = element_blank(),legend.position = "bottom") +
+  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+ annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
+#Line plot 
+ggplot(subset(ttable), aes(x=Year)) + 
+  geom_line(aes(y=inc.med*100, color=src.stage.f), size=2) +
+  geom_ribbon(aes(ymin=inc.lb*100, ymax=inc.ub*100, fill=src.stage.f), size=2, alpha=0.2) +
+  scale_x_continuous(expand = c(0,0), breaks=seq(1980,2045,5)) +
+  scale_y_continuous(breaks=seq(0,0.035,0.005)*100,expand = c(0,0),"new infections / 100 py") +
+  facet_grid(~scenario) +
+  coord_cartesian(xlim=c(1980, 2050)) + ggtitle("HIV incidence contribution by source stage of infection") +
+  theme(strip.background = element_rect(colour="white", fill="white"), axis.text.x = element_text(angle = 90),legend.title=element_blank(),axis.line = element_line(colour = "black"),panel.background = element_blank(),legend.position = "bottom") +
+  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+ annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
+#showing just 2016 and beyond to distill differences between scenarios
+ggplot(subset(ttable, Year>2015), aes(x=Year)) + 
+  geom_line(aes(y=inc.med*100, color=src.stage.f,linetype=scenario), size=2) +
+  #geom_ribbon(aes(ymin=inc.lb*100, ymax=inc.ub*100, fill=src.stage.f), size=2, alpha=0.2) +
+  scale_x_continuous(expand = c(0,0), breaks=seq(1980,2045,5)) +
+  scale_y_continuous(breaks=seq(0,0.5,0.1),expand = c(0,0),"new infections / 100 py") +
+  #facet_grid(~scenario) +
+  coord_cartesian(xlim=c(2016, 2050)) + ggtitle("HIV incidence contribution by source stage of infection") +
+  theme(strip.background = element_rect(colour="white", fill="white"), axis.text.x = element_text(angle = 90),legend.title=element_blank(),axis.line = element_line(colour = "black"),panel.background = element_blank(),legend.position = "bottom") +
+  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+ annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
+#Incidence contribution (proportion) by HIV stage
+
+#Stacked bar plot
+ggplot(subset(ttable), aes(fill=src.stage.f, y=prop.med*100, x=Year)) + 
+  geom_bar(position="stack", stat="identity") +
+  scale_x_continuous(expand = c(0,0), breaks=seq(1980,2045,5)) +
+  scale_y_continuous("Proportion of transmissions") +
+  facet_grid(~scenario) +
+  coord_cartesian(xlim=c(1980, 2050)) + ggtitle("HIV incidence contribution by source stage of infection") +
+  theme(strip.background = element_rect(colour="white", fill="white"), axis.text.x = element_text(angle = 90),legend.title=element_blank(),axis.line = element_line(colour = "black"),panel.background = element_blank(),legend.position = "bottom") +
+  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+ annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
+#Age contribution stacked bar plots 
+
+ggplot(subset(ttable.age), aes(fill=interaction(src.age.cat3, SRC_GENDER), y=inc.med*100, x=Year)) + 
+  geom_bar(position="stack", stat="identity") +
+  scale_x_continuous(expand = c(0,0), breaks=seq(1980,2045,5)) +
+  scale_y_continuous(breaks=seq(0,0.035,0.005)*100,expand = c(0,0),"new infections / 100 py") +
+  facet_grid(~scenario) +
+    scale_fill_manual(values = c(brewer.pal(n=3, name="Blues"), brewer.pal(n=3, name="Reds")),labels = c("Male 15-24", "Male 25-34", "Male 35+", "Female 25-34", "Female 25-34", "Female 35+"))+
+  coord_cartesian(xlim=c(1980, 2050)) + ggtitle("HIV incidence contribution by source stage of infection") +
+  theme(strip.background = element_rect(colour="white", fill="white"), axis.text.x = element_text(angle = 90),legend.title=element_blank(),axis.line = element_line(colour = "black"),panel.background = element_blank(),legend.position = "bottom") +
+  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+ annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
+ggplot(subset(ttable.age), aes(fill=interaction(src.age.cat3, SRC_GENDER), y=prop.med*100, x=Year)) + 
+  geom_bar(position="stack", stat="identity") +
+  scale_x_continuous(expand = c(0,0), breaks=seq(1980,2045,5)) +
+  scale_y_continuous("Proportion of total transmissions") +
+  facet_grid(~scenario) +
+  scale_fill_manual(values = c(brewer.pal(n=3, name="Blues"), brewer.pal(n=3, name="Reds")),labels = c("Male 15-24", "Male 25-34", "Male 35+", "Female 25-34", "Female 25-34", "Female 35+"))+
+  coord_cartesian(xlim=c(1980, 2050)) + ggtitle("Proportion contribution to total incidence by age-sex groups") +
+  theme(strip.background = element_rect(colour="white", fill="white"), axis.text.x = element_text(angle = 90),legend.title=element_blank(),axis.line = element_line(colour = "black"),panel.background = element_blank(),legend.position = "bottom") +
+  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+ annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf) +
+  guides(fill = guide_legend(nrow = 1))
+
+```
+
+## Transmisison flows
+
+```{r, fig.width=8, fig.height=8}
+#Plots are stratified on UTT era - chose one and then plot
+
+transmission.table.simple <- subset(network.data.m, era=="UTT era")  %>%
+  group_by(SRC_GENDER, DEST_GENDER, src.age.cat3, dest.age.cat3) %>%
+  summarize(transmissions=n())
+
+##
+transmission.table.simple$source.gender.age <- paste(transmission.table.simple$SRC_GENDER, transmission.table.simple$src.age.cat3)
+transmission.table.simple$destination.gender.age <- paste(transmission.table.simple$DEST_GENDER, transmission.table.simple$dest.age.cat3)
+
+flow.data <- data.frame("orig_reg" = transmission.table.simple$source.gender.age, "dest_reg" = transmission.table.simple$destination.gender.age, "Transmissions" = transmission.table.simple$transmissions)
+table(flow.data$orig_reg)
+
+flow.data$source <- as.numeric(as.factor(flow.data$orig_reg))-1 #must be zero indexed so subtract 1
+flow.data$target <- as.numeric(as.factor(flow.data$dest_reg))-1 #must be zero indexed so subtract 1
+head(flow.data)
+
+plot.data = data.frame("source"=flow.data$source, "target"=flow.data$target, "value"=flow.data$Transmissions)
+nodes <- data.frame("name"=c("Male 15-24","Male 25-34","Male 35+",
+                             "Female 15-24","Female 25-34","Female 35+"))
+plot.data.m <- plot.data[plot.data$source<3,] #plot for m -> f
+plot.data.f <- plot.data[plot.data$source>2,] #plot for f -> m
+
+sankeyNetwork(Links = plot.data.m, Nodes = nodes,
+              Source = "source", Target = "target",
+              Value = "value", NodeID = "name", nodeWidth = 30, fontSize = 24)
+
+sankeyNetwork(Links = plot.data.f, Nodes = nodes,
+              Source = "source", Target = "target",
+              Value = "value", NodeID = "name", nodeWidth = 30, fontSize = 24)
+
+```
+
+## Number of transmissions per infected per year
+
+```{r, fig.width=12, fig.height=8}
+#All ages
+t1 <- network.data.m  %>%
+  group_by(scenario, sim.id, SRC_GENDER, Year) %>%
+  summarize(transmissions=n()) 
+r1 <- subset(reporthivbyageandgender, Year>1981)  %>%
+  group_by(scenario, sim.id, SRC_GENDER, Year) %>%
+  summarize(Infected=sum(Infected)) 
+ttable <- merge(t1, r1, by=c("scenario","SRC_GENDER","Year","sim.id"), all.x=T) %>%
+  mutate(inc = transmissions/Infected) %>% #incidence of transmission among infected
+  group_by(scenario, SRC_GENDER, Year) %>%
+  summarize(inc.med=median(inc), inc.lb = quantile(inc, probs = 0.025), inc.ub = quantile(inc, probs = 0.975)) 
+
+labs <- c("1" = "Women", "0" = "Men")
+ggplot(subset(ttable)) + 
+  geom_line(aes(y=inc.med, x=Year, color=factor(SRC_GENDER), group=interaction(factor(SRC_GENDER),scenario),linetype=scenario), size=2) +
+  geom_ribbon(aes(ymin=inc.lb, ymax=inc.ub, x=Year, fill=factor(SRC_GENDER), group=interaction(factor(SRC_GENDER),scenario),alpha=scenario),alpha=0.2) +
+  #facet_grid(~scenario)+
+  scale_x_continuous(expand = c(0,0), breaks=seq(1980,2050,5)) +
+  scale_y_continuous(expand = c(0,0), breaks=seq(0,0.6,0.05)) + 
+  coord_cartesian(xlim=c(1982, 2050), ylim=c(0, 0.5)) +
+  xlab("Year")+ ylab("Transmissions per infected individual per year") +
+  scale_color_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  scale_fill_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  ggtitle("Risk of secondary transmission by sex") +
+  theme(strip.background = element_rect(colour="black", fill="white")) +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+        legend.title=element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.background = element_blank(),
+        legend.position = "bottom")
+
+#By age-group
+t1 <- network.data.m  %>%
+  group_by(scenario, sim.id,  SRC_GENDER, src.age.cat3, Year) %>%
+  summarize(transmissions=n()) 
+r1 <- subset(reporthivbyageandgender, Year>1981)  %>%
+  group_by(scenario, sim.id, SRC_GENDER, src.age.cat3, Year) %>%
+  summarize(Infected=sum(Infected)) 
+ttable <- merge(t1, r1, by=c("scenario","SRC_GENDER","src.age.cat3", "Year","sim.id"), all.x=T) %>%
+  mutate(inc = transmissions/Infected) %>% #incidence of transmission among infected
+  group_by(scenario, SRC_GENDER, src.age.cat3, Year) %>%
+  summarize(inc.med=median(inc), inc.lb = quantile(inc, probs = 0.025), inc.ub = quantile(inc, probs = 0.975)) 
+
+labs <- c("1" = "Women", "0" = "Men")
+ggplot(subset(ttable)) + 
+  geom_line(aes(y=inc.med, x=Year, color=factor(SRC_GENDER), group=interaction(factor(SRC_GENDER),scenario), linetype=scenario), size=2) +
+  #geom_ribbon(aes(ymin=inc.lb, ymax=inc.ub, x=Year, fill=factor(SRC_GENDER), group=interaction(factor(SRC_GENDER),scenario)),alpha=0.3) +
+  facet_grid(~src.age.cat3, labeller = labeller(src.age.cat3=labs.age3))+
+  scale_x_continuous(expand = c(0,0), breaks=seq(1980,2050,5)) +
+  scale_y_continuous(expand = c(0,0), breaks=seq(0,0.6,0.05)) + 
+  coord_cartesian(xlim=c(1982, 2050), ylim=c(0, 0.3)) +
+  xlab("Year")+ ylab("Transmissions per infected individual per year") +
+  scale_color_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  scale_fill_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  ggtitle("Risk of secondary transmission by sex") +
+  theme(strip.background = element_rect(colour="black", fill="white")) +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+        legend.title=element_blank(), axis.text.x = element_text(angle = 90),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.background = element_blank(),
+        legend.position = "bottom")
+```
+
+## Distribution of transmission events by time (years) from HIV acquisition
+In the pre-UTT era the generation time (time from index infection to secondary transmission) was limited by life expectancy without ART (~ 10 years).  Thus the distribution of generation times was truncated at 10 years.  Men tended to transmit more quickly than women - which reflects the higher degree of concurrency and partnership turnover rates among men.  In the UTT era life expectancy increased substantially, which extended the tail of the generation time distrution out to 40+ years.  Still, dynamics of the pre-UTT era are still reflective in the large relative contribution of early-stage transmission, which became an even larger component of transmission in the UTT era given the lower force of infection when PLHIV initiated ART after a 6-12 month delay from index infection.
+
+```{r, fig.width=15, fig.height=8}
+network.vars
+network.data.m$TimeToTransmission <- network.data.m$YEAR - network.data.m$acq.year #time from HIV acquisition until transmission event
+hist(network.data.m$TimeToTransmission[network.data.m$SRC_GENDER==0])
+hist(network.data.m$TimeToTransmission[network.data.m$SRC_GENDER==1])
+
+TimeToTransmissionIQR <- subset(network.data.m, scenario=="baseline" & is.na(TimeToTransmission)==F) %>% group_by(era, SRC_GENDER) %>%
+  summarize(median = quantile(TimeToTransmission, probs = 0.5),
+            lb = quantile(TimeToTransmission, probs = 0.25),
+            ub = quantile(TimeToTransmission, probs = 0.75))
+head(TimeToTransmissionIQR)
+  
+#Time to transmission density (among all transmission)
+#y = ..count../sum(..count..)
+labs <- c("1" = "Women", "0" = "Men")
+ggplot(subset(network.data.m, scenario=="baseline"), aes(x=TimeToTransmission, group=interaction(sim.id,SRC_GENDER), color=factor(SRC_GENDER))) +
+  geom_density(alpha=0.2, adjust=1/10) +
+  facet_grid(era~SRC_GENDER, labeller=labeller(SRC_GENDER = labs)) +
+  scale_color_manual(values = c("blue3","red2"), labels=c("Men","Women")) +
+  #scale_fill_manual(values = c("blue3","red2"), labels=c("Men","Women")) +
+  ggtitle("Distribution of time to transmission") +
+  theme_bw(base_size=24) +  xlab("Years")+ 
+  scale_x_continuous(expand = c(0,0),breaks=seq(0,39,5),limits=c(0,40)) + 
+  scale_y_continuous(expand = c(0,0), breaks=seq(0,0.15,0.05)) + coord_cartesian(ylim=c(0, 0.14)) +
+  geom_vline(data = subset(TimeToTransmissionIQR), aes(xintercept = median, color=factor(SRC_GENDER)),linetype=2) +
+  geom_vline(data = subset(TimeToTransmissionIQR), aes(xintercept = lb, color=factor(SRC_GENDER)), alpha=0.2,linetype=2) +
+  geom_vline(data = subset(TimeToTransmissionIQR), aes(xintercept = ub, color=factor(SRC_GENDER)), alpha=0.2,linetype=2) +
+  theme(strip.background = element_rect(colour="black", fill="white")) +
+  guides(fill = guide_legend(reverse=TRUE, nrow=1)) + labs(fill = "Years from HIV acquisition") +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), legend.title=element_blank(),
+        panel.grid.minor = element_blank(),axis.line = element_line(colour = "black"),
+        panel.background = element_blank(), legend.position = "bottom") +  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+
+  annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
+#Time to transmission density (among all transmission) by Age category
+labs <- c("1" = "Women", "0" = "Men")
+ggplot(subset(network.data.m, scenario=="baseline"), aes(x=TimeToTransmission, group=interaction(sim.id,SRC_GENDER), color=factor(SRC_GENDER))) +
+  geom_density(alpha=0.1, adjust=3) +
+  facet_grid(era~src.age.cat3, labeller=labeller(src.age.cat3 = labs.age3)) +
+  scale_color_manual(values = c("blue3","red2"), labels=c("Men","Women")) +
+  #scale_fill_manual(values = c("blue3","red2"), labels=c("Men","Women")) +
+  ggtitle("Distribution of time to transmission") +
+  theme_bw(base_size=24) +  xlab("Years")+ 
+  scale_x_continuous(expand = c(0,0),breaks=seq(0,50,5)) + 
+  scale_y_continuous(expand = c(0,0)) +
+  #geom_vline(data = subset(d2, scenario=="baseline"), aes(xintercept = median, color=factor(SRC_GENDER))) +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+        legend.title=element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.background = element_blank(),
+        legend.position = "bottom") +  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+
+  annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
+#Proportion of HIV transmissions occuring soon after acquisition 1,2,3...50 years (transmission perspective)?
+network.data.m$TimeToTransmissionCat <- cut(network.data.m$TimeToTransmission, c(0,1,5,10,50,100), right=F, dig.lab=4)
+table(network.data.m$TimeToTransmissionCat)
+table(network.data.m$era)
+
+#proportion of HIV acquisitions from transmitters with < 1 year from infection
+TimeToTransmissionProportions <- subset(network.data.m,  is.na(TimeToTransmissionCat)==F) %>%
+  group_by(scenario, sim.id, Year, dest.age.cat3, DEST_GENDER, TimeToTransmissionCat) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  group_by(scenario, Year, dest.age.cat3, DEST_GENDER, TimeToTransmissionCat) %>%
+  summarize(median = quantile(freq, probs = 0.5),
+            lb = quantile(freq, probs = 0.025),
+            ub = quantile(freq, probs = 0.975))
+head(TimeToTransmissionProportions)
+
+ggplot(subset(TimeToTransmissionProportions, TimeToTransmissionCat=="[0,1)" & scenario=="baseline")) + 
+  geom_point(aes(y=median, x=Year, color=factor(DEST_GENDER), group=factor(DEST_GENDER)), size=2) +
+  geom_line(aes(y=median, x=Year, color=factor(DEST_GENDER)), size=2) +
+  #geom_errorbar(aes(x=Year, ymin = lb, ymax = ub, color=factor(DEST_GENDER)), width = 0.2) +
+  geom_ribbon(aes(ymin=lb, ymax=ub, x=Year, fill=factor(DEST_GENDER), group=factor(DEST_GENDER)),alpha=0.3) +
+  facet_grid(~dest.age.cat3, labeller = labeller(dest.age.cat3=labs.age3))+
+  scale_x_continuous(expand = c(0,0), breaks=seq(1980,2050,5)) +
+  scale_y_continuous(expand = c(0,0), breaks=seq(0,1,0.05)) + 
+  coord_cartesian(ylim=c(0, 1)) +
+  xlab("Year")+ ylab("Proportion") +
+  scale_color_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  scale_fill_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  ggtitle("Proportion of HIV acquisitions from transitters infected for < 1 year") +
+  theme(strip.background = element_rect(colour="black", fill="white")) +
+  theme(panel.border = element_blank(),
+        legend.title=element_blank(),
+        panel.grid.minor = element_blank(), axis.text.x = element_text(angle = 90),
+        axis.line = element_line(colour = "black"),
+        panel.background = element_blank(),
+        legend.position = "bottom")
+
+#proportion of HIV transmissions from transmitters with < 1 year from infection
+TimeToTransmissionProportions <- subset(network.data.m,  is.na(TimeToTransmissionCat)==F) %>%
+  group_by(scenario, sim.id, Year, src.age.cat3, SRC_GENDER, TimeToTransmissionCat) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  group_by(scenario, Year, src.age.cat3, SRC_GENDER, TimeToTransmissionCat) %>%
+  summarize(median = quantile(freq, probs = 0.5),
+            lb = quantile(freq, probs = 0.025),
+            ub = quantile(freq, probs = 0.975))
+head(TimeToTransmissionProportions)
+
+ggplot(subset(TimeToTransmissionProportions, TimeToTransmissionCat=="[0,1)" & scenario=="baseline")) + 
+  geom_point(aes(y=median, x=Year, color=factor(SRC_GENDER), group=factor(SRC_GENDER)), size=2) +
+  geom_line(aes(y=median, x=Year, color=factor(SRC_GENDER)), size=2) +
+  #geom_errorbar(aes(x=Year, ymin = lb, ymax = ub, color=factor(SRC_GENDER)), width = 0.2) +
+  geom_ribbon(aes(ymin=lb, ymax=ub, x=Year, fill=factor(SRC_GENDER), group=factor(SRC_GENDER)),alpha=0.3) +
+  facet_grid(~src.age.cat3, labeller = labeller(src.age.cat3=labs.age3))+
+  scale_x_continuous(expand = c(0,0), breaks=seq(1980,2050,5)) +
+  scale_y_continuous(expand = c(0,0), breaks=seq(0,1,0.05)) + 
+  coord_cartesian(ylim=c(0, 1)) +  theme_bw(base_size=20) +
+  xlab("Year")+ ylab("Proportion") +
+  scale_color_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  scale_fill_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  ggtitle("Proportion of HIV transmissions from transmitters infected for < 1 year") +
+  theme(strip.background = element_rect(colour="black", fill="white")) +
+  theme(panel.border = element_blank(),
+        legend.title=element_blank(),
+        panel.grid.minor = element_blank(), axis.text.x = element_text(angle = 90),
+        axis.line = element_line(colour = "black"),
+        panel.background = element_blank(),
+        legend.position = "bottom")
+
+```
+
+## Estimate Reff within the first year of acquisition (How many secondary transmissions occur among those infected for < 1 year?)
+
+```{r, fig.width=18, fig.height=12}
+
+t1 <- network.data.m %>% 
+  filter(!is.na(acq.year)) %>% mutate(acq.year = floor(acq.year)) %>%
+  group_by(scenario, sim.id, SRC_GENDER, acq.year, MonthsToTransmission) %>%
+  summarize(transmissions = n()) 
+t1.all <- network.data.m %>% #now aggregate across both genders
+  filter(!is.na(acq.year)) %>% mutate(acq.year = floor(acq.year)) %>%
+  group_by(scenario, sim.id, acq.year, MonthsToTransmission) %>%
+  summarize(transmissions = n()) 
+date.of.acquisition2 <- data.frame("SRC_ID"=transmissionreport$DEST_ID, "SRC_GENDER"=transmissionreport$DEST_GENDER, "acq.year"=transmissionreport$YEAR,  "sim.id"=transmissionreport$sim.id, "scenario"=transmissionreport$scenario) #source id used to merge in with source of transmitters
+date.of.acquisition2.all <- data.frame("SRC_ID"=transmissionreport$DEST_ID, "acq.year"=transmissionreport$YEAR,  "sim.id"=transmissionreport$sim.id, "scenario"=transmissionreport$scenario) #source id used to merge in with source of transmitters, this is aggregated across both genders
+r1 <- date.of.acquisition2  %>% mutate(acq.year = floor(acq.year)) %>%
+  group_by(scenario, sim.id, SRC_GENDER, acq.year) %>% summarize(count=n()) 
+r1.all <- date.of.acquisition2.all  %>% mutate(acq.year = floor(acq.year)) %>% #do for both genders
+  group_by(scenario, sim.id, acq.year) %>% summarize(count=n()) 
+ttable <- left_join(t1,r1,by=c("scenario","sim.id","SRC_GENDER","acq.year"))
+ttable.all <- left_join(t1.all,r1.all,by=c("scenario","sim.id","acq.year"))
+ttable <- ttable %>% mutate(reff.transperperson = transmissions/count) 
+ttable.all <- ttable.all %>% mutate(reff.transperperson = transmissions/count, SRC_GENDER=2)  
+ttable.merge <- rbind(ttable,ttable.all)
+
+timeframe = 30*12 #time horizon in months to calculate Reff (default is 30 years * 12 months)
+#fill in missing month and add zeros if there were not transmission events during that month (this takes about 1 min per year)
+ttable.selection1 <- complete(subset(ttable.merge, MonthsToTransmission<timeframe & acq.year%in%c(1990, 2000, 2010, 2020)), 
+                             MonthsToTransmission = 1:timeframe, fill = list(reff.transperperson = 0))
+
+ttable.selection <- ttable.selection1  %>%
+  group_by(scenario, sim.id, SRC_GENDER, acq.year) %>% #get cumulative sum
+  mutate(reffx.cum = cumsum(reff.transperperson), scenario_f = factor(scenario, levels=c('baseline',"ART100pct"))) %>%
+  group_by(scenario, sim.id, SRC_GENDER, acq.year) %>%
+  gather(Metric, Value, reff.transperperson:reffx.cum)
+
+ttable.selection.med <- ttable.selection %>% group_by(scenario, SRC_GENDER, acq.year, MonthsToTransmission, Metric) %>% summarize(med.Value=mean(Value))
+
+#Cumulative Reff over time (years)
+labs <- c("2"="All", "1" = "Women", "0" = "Men")
+labs.metric <- c("reff.transperperson"="Year-specific R effective", "reffx.cum" = "cumulative R-effective")
+labs.scenario <- c("baseline"="90-90-90", "ART100pct" = "100% ART init.")
+ggplot(subset(ttable.selection, scenario=="baseline" & acq.year==2010)) + 
+  #geom_point(aes(y=Value, x=MonthsToTransmission/12, color=factor(SRC_GENDER), group=interaction(sim.id, SRC_GENDER)), size=1,  alpha=0.01) +
+  geom_line(aes(y=Value, x=MonthsToTransmission/12, color=factor(SRC_GENDER), group=interaction(sim.id, SRC_GENDER)), size=1, alpha=0.01) +
+  #geom_line(data=subset(ttable.selection.med, scenario=="baseline" & acq.year==2010), aes(y=med.Value, x=MonthsToTransmission/12, color=factor(SRC_GENDER), group=(SRC_GENDER)), size=1) +
+  #geom_smooth(aes(x=MonthsToTransmission/12, y=Value, group=factor(SRC_GENDER), color=factor(SRC_GENDER)),method="loess", span=0.05, se = F, size=2, linetype=1) +
+  facet_wrap(scenario_f~Metric, labeller=labeller(scenario_f=labs.scenario), scales="free")+
+  #geom_hline(yintercept=1, linetype=2) +
+  scale_x_continuous(breaks=seq(0,timeframe/12,1)) + 
+  #scale_y_continuous(expand = c(0,0)) + #, breaks=seq(0,1.5,0.1)) + coord_cartesian(ylim=c(0, 1.5)) +
+  xlab("Years since HIV acquisition")+ ylab("Reff") +
+  scale_color_manual(values = c("blue", "red","purple"), labels = c("Male", "Female","All"))+
+  #scale_fill_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  ggtitle("Number of secondary transmissions per infected individual by year from HIV acquisition") +
+  theme(strip.background = element_rect(colour="black", fill="white")) +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+        legend.title=element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.background = element_blank(),
+        legend.position = "bottom") +  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+
+  annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
+#Reff by month and cumulative Reff over time (months)
+ggplot(subset(ttable.selection)) + 
+  #geom_point(aes(y=Value, x=MonthsToTransmission, color=factor(SRC_GENDER), group=interaction(sim.id, SRC_GENDER)), size=1,  alpha=0.03) +
+  geom_line(aes(y=Value, x=MonthsToTransmission, color=factor(SRC_GENDER), group=interaction(sim.id, SRC_GENDER)), size=1, alpha=0.03) +
+  #geom_line(data=subset(ttable.selection.med,MonthsToTransmission<25& scenario=="baseline"), aes(y=med.Value, x=MonthsToTransmission, color=factor(SRC_GENDER), group=interaction(SRC_GENDER)), size=1) +
+  #geom_smooth(aes(x=MonthsToTransmission, y=Value, group=factor(SRC_GENDER), color=factor(SRC_GENDER)),method="loess", span=0.2, se = F, size=2, linetype=1) +
+  facet_grid(acq.year~Metric, scales="free", labeller=labeller(Metric=labs.metric, scenario_f=labs.scenario))+
+  #geom_hline(yintercept=1) +
+  scale_x_continuous(expand = c(0,0), breaks=seq(0,timeframe,1)) + 
+  scale_y_continuous(expand = c(0,0)) +
+  xlab("Months since HIV acquisition")+ ylab("Reff") +
+  scale_color_manual(values = c("blue", "red","purple"), labels = c("Male", "Female","All"))+
+  #scale_fill_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  ggtitle("Number of transmissions per infected individual by month from HIV acquisition") +
+  theme(strip.background = element_rect(colour="black", fill="white")) +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+        legend.title=element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.background = element_blank(),
+        legend.position = "bottom") +  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+
+  annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
+########################################################################################################
+#iterate R effective over all year/time horizon combinations
+t1 <- network.data.m %>% 
+  filter(!is.na(acq.year)) %>% mutate(acq.year = floor(acq.year)) %>%
+  group_by(scenario, sim.id, SRC_GENDER, acq.year, YearsToTransmission) %>%
+  summarize(transmissions = n()) 
+t1.all <- network.data.m %>% #now aggregate across both genders
+  filter(!is.na(acq.year)) %>% mutate(acq.year = floor(acq.year)) %>%
+  group_by(scenario, sim.id, acq.year, YearsToTransmission) %>%
+  summarize(transmissions = n()) 
+date.of.acquisition2 <- data.frame("SRC_ID"=transmissionreport$DEST_ID, "SRC_GENDER"=transmissionreport$DEST_GENDER, "acq.year"=transmissionreport$YEAR,  "sim.id"=transmissionreport$sim.id, "scenario"=transmissionreport$scenario) #source id used to merge in with source of transmitters
+date.of.acquisition2.all <- data.frame("SRC_ID"=transmissionreport$DEST_ID, "acq.year"=transmissionreport$YEAR,  "sim.id"=transmissionreport$sim.id, "scenario"=transmissionreport$scenario) #source id used to merge in with source of transmitters, this is aggregated across both genders
+r1 <- date.of.acquisition2  %>% mutate(acq.year = floor(acq.year)) %>%
+  group_by(scenario, sim.id, SRC_GENDER, acq.year) %>% summarize(count=n()) 
+r1.all <- date.of.acquisition2.all  %>% mutate(acq.year = floor(acq.year)) %>% #do for both genders
+  group_by(scenario, sim.id, acq.year) %>% summarize(count=n()) 
+ttable <- left_join(t1,r1,by=c("scenario","sim.id","SRC_GENDER","acq.year"))
+ttable.all <- left_join(t1.all,r1.all,by=c("scenario","sim.id","acq.year"))
+ttable <- ttable %>% mutate(transperperson = transmissions/count) 
+ttable.all <- ttable.all %>% mutate(transperperson = transmissions/count, SRC_GENDER=2)  
+ttable.merge <- rbind(ttable,ttable.all)
+
+timeframe = 30 #time horizon in years to calculate Reff
+ttable.years.selection <- complete(subset(ttable.merge, YearsToTransmission<timeframe+1 & acq.year%in%seq(1980,2020,5)), YearsToTransmission = 1:timeframe, fill = list(transperperson = 0)) #fill in missing month and add zeros if there were not transmission events during that month
+ttable.yearscumsum.cont <- 
+  ttable.years.selection %>% 
+  group_by(scenario, sim.id, SRC_GENDER, acq.year) %>% #get cumulative sum
+  mutate(reff = cumsum(transperperson), scenario_f = factor(scenario, levels=c('baseline',"ART100pct"))) %>%
+  group_by(scenario_f, SRC_GENDER, acq.year, YearsToTransmission) %>%    
+  summarize(med.transperperson=mean(transperperson), med.reff=mean(reff))  #get mean across 250 simulations 
+#categorize continuous yeartstotransmission into fewer categories for better plotting
+cuts <- c(0,1,2,3,4,5,10,15,20,25,30)
+ttable.yearscumsum.cont$med.transperperson.cat <- cut(ttable.yearscumsum.cont$YearsToTransmission, cuts, right=T)
+ttable.yearscumsum.cont$TransmissionYear <- ttable.yearscumsum.cont$YearsToTransmission + ttable.yearscumsum.cont$acq.year
+ttable.yearscumsum <-  ttable.yearscumsum.cont %>% 
+  group_by(scenario_f, SRC_GENDER, acq.year, med.transperperson.cat) %>% 
+  summarise(med.transperperson =sum(med.transperperson), med.reff = max(med.reff), YearsToTransmission=max(YearsToTransmission))
+ttable.yearscumsum$YearsToTransmission.rev <- factor(ttable.yearscumsum$YearsToTransmission, levels = rev(levels(factor(ttable.yearscumsum$YearsToTransmission))))
+
+#Reff by year from acquisition and acquisition year
+colfunc <- colorRampPalette(c("white", "white"))
+colfunc(10)
+labs <- c("2"="All", "1" = "Women", "0" = "Men")
+ggplot(subset(ttable.yearscumsum)) + 
+  geom_area(aes(y=med.transperperson, x=acq.year, fill=(YearsToTransmission.rev)), size=1, position="stack") +
+  geom_line(data=subset(ttable.yearscumsum, YearsToTransmission==30), aes(y=med.reff, x=acq.year), color="black", size=1) +
+  facet_grid(scenario_f~SRC_GENDER, labeller=labeller(SRC_GENDER=labs, scenario_f=labs.scenario))+
+  #scale_x_continuous(expand = c(0,0), breaks=c(1980,2020,5)) + 
+  scale_y_continuous(expand = c(0,0), breaks=seq(0,2.9,0.5)) + coord_cartesian(ylim=c(0,3)) +
+  xlab("Year of index HIV acquisition")+ ylab("R effective") +
+  geom_hline(yintercept=1, linetype=2) +   theme(text=element_text(size=24))+
+  #scale_color_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  scale_fill_manual(values=colfunc(10))+
+  ggtitle("Number of HIV transmissions per infected by year of index acquisition and time from acquisition") +
+  theme(strip.background = element_rect(colour="black", fill="white")) +
+  guides(fill = guide_legend(reverse=TRUE, nrow=1)) + labs(fill = "Years from HIV acquisition") +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),axis.line = element_line(colour = "black"),
+        panel.background = element_blank(), legend.position = "bottom") +  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+
+  annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
+labs <- c("2"="All", "1" = "Women", "0" = "Men")
+ggplot(subset(ttable.yearscumsum)) + 
+  geom_area(aes(y=med.transperperson, x=acq.year, fill=factor(YearsToTransmission.rev)), size=1, position="stack") +
+  geom_line(data=subset(ttable.yearscumsum, YearsToTransmission==30), aes(y=med.reff, x=acq.year), color="black", size=1) +
+  facet_grid(scenario_f~SRC_GENDER, labeller=labeller(SRC_GENDER=labs, scenario_f=labs.scenario))+
+  #scale_x_continuous(expand = c(0,0), breaks=c(1980,2020,5)) + 
+  scale_y_continuous(expand = c(0,0), breaks=seq(0,2.9,0.5)) + coord_cartesian(ylim=c(0,3)) +
+  xlab("Year of index HIV acquisition")+ ylab("R effective") +
+  geom_hline(yintercept=1, linetype=2) +   theme(text=element_text(size=24))+
+  #scale_color_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  #scale_fill_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  ggtitle("Number of HIV transmissions per infected by year of index acquisition and time from acquisition") +
+  theme(strip.background = element_rect(colour="black", fill="white")) +
+  guides(fill = guide_legend(reverse=TRUE, nrow=1)) + labs(fill = "Years from HIV acquisition") +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),axis.line = element_line(colour = "black"),
+        panel.background = element_blank(), legend.position = "bottom") +  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+
+  annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
+#Reff cross section
+labs <- c("2"="All", "1" = "Women", "0" = "Men")
+ggplot(subset(ttable.yearscumsum, SRC_GENDER==2 & acq.year%in%c(1990,2000,2020))) + 
+  geom_line(aes(y=med.reff, x=YearsToTransmission, group=acq.year), size=1) +
+  geom_point(aes(y=med.reff, x=YearsToTransmission, color=factor(YearsToTransmission.rev)), size=4) +
+  facet_grid(scenario_f~SRC_GENDER, labeller=labeller(SRC_GENDER=labs, scenario_f=labs.scenario))+
+  scale_x_continuous(breaks=cuts) + scale_y_continuous(expand = c(0,0), breaks=seq(0,2,0.5)) + coord_cartesian(ylim=c(0, 1.9)) +
+  xlab("Year of HIV acquisition")+ ylab("R effective") +
+  geom_hline(yintercept=1, linetype=2) +   theme(text=element_text(size=24))+
+  #scale_color_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  #scale_fill_manual(values = c("blue", "red"), labels = c("Male", "Female"))+
+  ggtitle("Number of transmissions per infected individual by year of HIV acquisition and time from acquisition") +
+  theme(strip.background = element_rect(colour="black", fill="white")) +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),axis.line = element_line(colour = "black"),
+        panel.background = element_blank(), legend.position = "none") +  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+
+  annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
