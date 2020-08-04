@@ -359,6 +359,7 @@ ggplot(subset(ttable)) +
 In the pre-UTT era the generation time (time from index infection to secondary transmission) was limited by life expectancy without ART (~ 10 years).  Thus the distribution of generation times was truncated at 10 years.  Men tended to transmit more quickly than women - which reflects the higher degree of concurrency and partnership turnover rates among men.  In the UTT era life expectancy increased substantially, which extended the tail of the generation time distrution out to 40+ years.  Still, dynamics of the pre-UTT era are still reflective in the large relative contribution of early-stage transmission, which became an even larger component of transmission in the UTT era given the lower force of infection when PLHIV initiated ART after a 6-12 month delay from index infection.
 
 ```{r, fig.width=15, fig.height=8}
+network.vars
 network.data.m$TimeToTransmission <- network.data.m$YEAR - network.data.m$acq.year #time from HIV acquisition until transmission event
 hist(network.data.m$TimeToTransmission[network.data.m$SRC_GENDER==0])
 hist(network.data.m$TimeToTransmission[network.data.m$SRC_GENDER==1])
