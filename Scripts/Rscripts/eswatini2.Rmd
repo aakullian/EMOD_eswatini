@@ -358,7 +358,7 @@ ggplot(subset(ttable)) +
 ## Distribution of transmission events by time (years) from HIV acquisition
 In the pre-UTT era the generation time (time from index infection to secondary transmission) was limited by life expectancy without ART (~ 10 years).  Thus the distribution of generation times was truncated at 10 years.  Men tended to transmit more quickly than women - which reflects the higher degree of concurrency and partnership turnover rates among men.  In the UTT era life expectancy increased substantially, which extended the tail of the generation time distrution out to 40+ years.  Still, dynamics of the pre-UTT era are still reflective in the large relative contribution of early-stage transmission, which became an even larger component of transmission in the UTT era given the lower force of infection when PLHIV initiated ART after a 6-12 month delay from index infection.
 
-```{r, fig.width=15, fig.height=8}
+```{r, fig.width=14, fig.height=8}
 network.data.m$TimeToTransmission <- network.data.m$YEAR - network.data.m$acq.year #time from HIV acquisition until transmission event
 hist(network.data.m$TimeToTransmission[network.data.m$SRC_GENDER==0])
 hist(network.data.m$TimeToTransmission[network.data.m$SRC_GENDER==1])
@@ -368,19 +368,18 @@ TimeToTransmissionIQR <- subset(network.data.m, scenario=="baseline" & is.na(Tim
             lb = quantile(TimeToTransmission, probs = 0.25),
             ub = quantile(TimeToTransmission, probs = 0.75))
 head(TimeToTransmissionIQR)
-  
-#Time to transmission density (among all transmission)
-#y = ..count../sum(..count..)
+
 labs <- c("1" = "Women", "0" = "Men")
 ggplot(subset(network.data.m, scenario=="baseline"), aes(x=TimeToTransmission, group=interaction(sim.id,SRC_GENDER), color=factor(SRC_GENDER))) +
-  geom_density(alpha=0.2, adjust=1/10) +
+  geom_density(alpha=0.2, adjust=1/10, size=1.2) +
+  #geom_density(data=subset(network.data.m, scenario=="baseline" & TimeToTransmission<1),alpha=0.2, adjust=1/10) +
   facet_grid(era~SRC_GENDER, labeller=labeller(SRC_GENDER = labs)) +
   scale_color_manual(values = c("blue3","red2"), labels=c("Men","Women")) +
   #scale_fill_manual(values = c("blue3","red2"), labels=c("Men","Women")) +
   ggtitle("Distribution of time to transmission") +
   theme_bw(base_size=24) +  xlab("Years")+ 
-  scale_x_continuous(expand = c(0,0),breaks=seq(0,39,5),limits=c(0,40)) + 
-  scale_y_continuous(expand = c(0,0), breaks=seq(0,0.15,0.05)) + coord_cartesian(ylim=c(0, 0.14)) +
+  scale_x_continuous(expand = c(0,0), breaks=seq(0,39,5),limits=c(0,40)) + 
+  scale_y_continuous(expand = c(0,0), breaks=seq(0,0.15,0.05)) + coord_cartesian(ylim=c(0, 0.16)) +
   geom_vline(data = subset(TimeToTransmissionIQR), aes(xintercept = median, color=factor(SRC_GENDER)),linetype=2) +
   geom_vline(data = subset(TimeToTransmissionIQR), aes(xintercept = lb, color=factor(SRC_GENDER)), alpha=0.2,linetype=2) +
   geom_vline(data = subset(TimeToTransmissionIQR), aes(xintercept = ub, color=factor(SRC_GENDER)), alpha=0.2,linetype=2) +
@@ -390,6 +389,46 @@ ggplot(subset(network.data.m, scenario=="baseline"), aes(x=TimeToTransmission, g
         panel.grid.minor = element_blank(),axis.line = element_line(colour = "black"),
         panel.background = element_blank(), legend.position = "bottom") +  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+
   annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
+  
+#Time to transmission density (among all transmission)
+ggplot(subset(network.data.m, scenario=="baseline" & is.na(TimeToTransmission)==F), aes(x=TimeToTransmission, after_stat(density), colour = factor(SRC_GENDER))) +
+  geom_freqpoly(aes(group=interaction(sim.id, SRC_GENDER)), binwidth = 1, alpha=0.2) +
+  geom_freqpoly(aes(group=(SRC_GENDER)), binwidth = 1, size=2) +
+  facet_grid(era~SRC_GENDER, labeller=labeller(SRC_GENDER = labs)) +
+  scale_x_continuous(expand = c(0,0), breaks=c(seq(0,9,1),seq(10,50,5))) + xlab("Years to transmission") +
+  scale_y_continuous(expand = c(0,0), breaks=seq(0,0.5,0.05)) + 
+  coord_cartesian(xlim=c(0,49), ylim=c(0, 0.15)) +
+  scale_color_manual(values = c("blue3","red2"), labels=c("Men","Women")) + theme_bw(base_size=18) +
+  geom_vline(data = subset(TimeToTransmissionIQR), aes(xintercept = median, color=factor(SRC_GENDER)),linetype=2, size=1.5) +
+  geom_vline(data = subset(TimeToTransmissionIQR), aes(xintercept = lb, color=factor(SRC_GENDER)), linetype=2) +
+  geom_vline(data = subset(TimeToTransmissionIQR), aes(xintercept = ub, color=factor(SRC_GENDER)), linetype=2) +
+  theme(strip.background = element_rect(colour="black", fill="white")) +
+  guides(fill = guide_legend(reverse=TRUE, nrow=1)) + labs(fill = "Years from HIV acquisition") + 
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), legend.title=element_blank(),
+        panel.grid.minor = element_blank(),axis.line = element_line(colour = "black"),
+        panel.background = element_blank(), legend.position = "bottom") +  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+
+  annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
+# Month by month time to transmission density (among all transmission)
+#
+labs <- c("1" = "Women", "0" = "Men")
+ggplot(subset(network.data.m, scenario=="baseline" & TimeToTransmission<=1), aes(x=TimeToTransmission, group=interaction(sim.id,SRC_GENDER), color=factor(SRC_GENDER))) +
+  geom_density(alpha=0.2, adjust=1/10) +
+  facet_grid(era~SRC_GENDER, labeller=labeller(SRC_GENDER = labs)) +
+  scale_color_manual(values = c("blue3","red2"), labels=c("Men","Women")) +
+  #scale_fill_manual(values = c("blue3","red2"), labels=c("Men","Women")) +
+  ggtitle("Distribution of time to transmission") +
+  theme_bw(base_size=24) +  xlab("Years")+ 
+  #scale_x_continuous(expand = c(0,0),breaks=seq(0,39,5),limits=c(0,40)) + 
+  #scale_y_continuous(expand = c(0,0), breaks=seq(0,0.15,0.05)) 
+  theme(strip.background = element_rect(colour="black", fill="white")) +
+  guides(fill = guide_legend(reverse=TRUE, nrow=1)) + labs(fill = "Years from HIV acquisition") +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), legend.title=element_blank(),
+        panel.grid.minor = element_blank(),axis.line = element_line(colour = "black"),
+        panel.background = element_blank(), legend.position = "bottom") +  annotate("segment", x=-Inf, xend=Inf, y=-Inf, yend=-Inf)+
+  annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
+
 
 #Time to transmission density (among all transmission) by Age category
 labs <- c("1" = "Women", "0" = "Men")
@@ -486,24 +525,28 @@ ggplot(subset(TimeToTransmissionProportions, TimeToTransmissionCat=="[0,1)" & sc
 
 ```{r, fig.width=18, fig.height=12}
 
-t1 <- network.data.m %>% 
+t1 <- network.data.m %>% #count number of transmissions by scenario, sim.id, gender, acquisition year, and months to transmission
   filter(!is.na(acq.year)) %>% mutate(acq.year = floor(acq.year)) %>%
   group_by(scenario, sim.id, SRC_GENDER, acq.year, MonthsToTransmission) %>%
   summarize(transmissions = n()) 
-t1.all <- network.data.m %>% #now aggregate across both genders
+t1.all <- network.data.m %>% #now do the same but across both genders
   filter(!is.na(acq.year)) %>% mutate(acq.year = floor(acq.year)) %>%
   group_by(scenario, sim.id, acq.year, MonthsToTransmission) %>%
   summarize(transmissions = n()) 
+#create data frame to calculate the number of individuals who acquire HIV (index infections) by year and gender
 date.of.acquisition2 <- data.frame("SRC_ID"=transmissionreport$DEST_ID, "SRC_GENDER"=transmissionreport$DEST_GENDER, "acq.year"=transmissionreport$YEAR,  "sim.id"=transmissionreport$sim.id, "scenario"=transmissionreport$scenario) #source id used to merge in with source of transmitters
+#create data frame to calculate the number of individuals who acquire HIV (index infections) by year (both genders)
 date.of.acquisition2.all <- data.frame("SRC_ID"=transmissionreport$DEST_ID, "acq.year"=transmissionreport$YEAR,  "sim.id"=transmissionreport$sim.id, "scenario"=transmissionreport$scenario) #source id used to merge in with source of transmitters, this is aggregated across both genders
-r1 <- date.of.acquisition2  %>% mutate(acq.year = floor(acq.year)) %>%
+#count number of index acquisitions by year
+r1 <- date.of.acquisition2  %>% mutate(acq.year = floor(acq.year)) %>% 
   group_by(scenario, sim.id, SRC_GENDER, acq.year) %>% summarize(count=n()) 
 r1.all <- date.of.acquisition2.all  %>% mutate(acq.year = floor(acq.year)) %>% #do for both genders
   group_by(scenario, sim.id, acq.year) %>% summarize(count=n()) 
+#combine number of index acquisitions with number of transmissions
 ttable <- left_join(t1,r1,by=c("scenario","sim.id","SRC_GENDER","acq.year"))
 ttable.all <- left_join(t1.all,r1.all,by=c("scenario","sim.id","acq.year"))
 ttable <- ttable %>% mutate(reff.transperperson = transmissions/count) 
-ttable.all <- ttable.all %>% mutate(reff.transperperson = transmissions/count, SRC_GENDER=2)  
+ttable.all <- ttable.all %>% mutate(reff.transperperson = transmissions/count, SRC_GENDER=2)  #calculate reff as transmissions per number of index acquisitions
 ttable.merge <- rbind(ttable,ttable.all)
 
 timeframe = 30*12 #time horizon in months to calculate Reff (default is 30 years * 12 months)
@@ -546,7 +589,7 @@ ggplot(subset(ttable.selection, scenario=="baseline" & acq.year==2010)) +
   annotate("segment", x=-Inf, xend=-Inf, y=-Inf, yend=Inf)
 
 #Reff by month and cumulative Reff over time (months)
-ggplot(subset(ttable.selection)) + 
+ggplot(subset(ttable.selection, MonthsToTransmission<13 & acq.year==2010)) + 
   #geom_point(aes(y=Value, x=MonthsToTransmission, color=factor(SRC_GENDER), group=interaction(sim.id, SRC_GENDER)), size=1,  alpha=0.03) +
   geom_line(aes(y=Value, x=MonthsToTransmission, color=factor(SRC_GENDER), group=interaction(sim.id, SRC_GENDER)), size=1, alpha=0.03) +
   #geom_line(data=subset(ttable.selection.med,MonthsToTransmission<25& scenario=="baseline"), aes(y=med.Value, x=MonthsToTransmission, color=factor(SRC_GENDER), group=interaction(SRC_GENDER)), size=1) +
