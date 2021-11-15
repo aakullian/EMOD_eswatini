@@ -12,7 +12,7 @@ input_dir <- "C:\\Users\\aakullian\\Dropbox (IDM)\\GitHub\\EMOD_eswatini\\eSwati
 ##################################################################################################
 #baseline scenario
 ##################################################################################################
-scenario <- "Baseline-campaign_reftrack_increase_update_period-baseline_increase_update_period"
+scenario <- "Baseline-campaign_original-Baseline"
 
 #Bring in newest downloaded baseline transmission data + reportHIVbyageandgender from same sim folders
 dir <- paste(input_dir, scenario, "\\ReportHIVByAgeAndGender",sep="")
@@ -127,13 +127,13 @@ transmissionreport.ART100pct <- transmission.data.frame
 #combine into one reportHIV and one transmission datafile
 ##################################################################################################
 reporthivbyageandgender.baseline$scenario = "baseline"
-reporthivbyageandgender.ART100pct$scenario = "ART100pct"
+reporthivbyageandgender.ART100pct$scenario = "simple_cascade"
 transmissionreport.baseline$scenario = "baseline"
-transmissionreport.ART100pct$scenario = "ART100pct"
+transmissionreport.ART100pct$scenario = "simple_cascade"
 
 reporthivbyageandgender <- rbind(reporthivbyageandgender.baseline, reporthivbyageandgender.ART100pct)
 transmissionreport <- rbind(transmissionreport.baseline, transmissionreport.ART100pct)
-table(reporthivbyageandgender$scenario)
+head(transmissionreport)
 
 #save an Rda data file for inputs: 
 save(reporthivbyageandgender, transmissionreport, file = "inputfiles2.rda")

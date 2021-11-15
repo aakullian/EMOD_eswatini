@@ -17,7 +17,7 @@ from simtools.SetupParser import SetupParser
 SetupParser.default_block = 'HPC'
 
 # The suite of experiments/simulations to copy, modify, and run
-original_suite_id = '2b17c314-4804-ea11-a2c3-c4346bcb1551'
+original_suite_id = 'c79aa54e-2578-ea11-a2c5-c4346bcb1550'
 
 
 def modify_config_json(filename):
