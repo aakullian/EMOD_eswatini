@@ -98,9 +98,10 @@ def copy_simulation(simulation, to_experiment):
 
     new_simulation = Simulation(simulation.name, description=simulation.description)
     new_simulation.experiment_id = to_experiment.id
-
     tags = copy.copy(simulation.tags)
     tags["CopiedFromSimulation"] = simulation.id
+    tags["parameterization_id"] = tags["TPI"]
+    tags["Run_Number"] = tags.get("Run_Number", 1)  # dummy run number if original sim does not have it as a tag
     new_simulation.set_tags(tags)
 
     job = simulation.hpc_jobs[-1]
